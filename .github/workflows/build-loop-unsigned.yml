@@ -1,0 +1,169 @@
+# Loop 免开发者账号方案：在 GitHub Actions 上编译出【未签名】Loop IPA
+#
+# 用法：把本文件放到你 fork 的 LoopWorkspace 仓库的 .github/workflows/ 目录下，
+#       文件名就用 build-loop-unsigned.yml，然后到 Actions 标签页点 Run workflow。
+#
+# 参数来源（照官方 LoopKit/LoopWorkspace 的 .github/workflows/build_loop.yml 与
+# fastlane/Fastfile 抄的，不是猜的）：
+#   runner: macos-26  /  Xcode: /Applications/Xcode_26.5.app
+#   scheme: LoopWorkspace  /  configuration: Release  /  destination: generic/platform=iOS
+#   官方用的 action 版本：actions/checkout@v5、actions/upload-artifact@v6（本文件保持一致）
+#
+# 与官方工作流的区别：官方用 fastlane match 向 Apple 申请证书并上传 TestFlight（必须付费账号）；
+#   本工作流只编译、不签名、不上传，产出的 IPA 交给手机上的 SideStore 用免费 Apple ID 重签。
+#
+# ！！本文件是照官方参数改写的模板，未经真实 runner 验证！！
+#   第一次运行请留 30 分钟排错，常见报错与改法见文件末尾注释。
+
+name: Build Loop Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_prefix:
+        description: "唯一包名前缀（改成你自己的英文串，例如 zhang0713loop，不要用 loopkit）"
+        required: true
+        default: "myloop"
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Select Xcode version
+        run: sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
+
+      - name: Checkout with submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Configure for free-account build
+        run: |
+          set -x
+          PREFIX="${{ inputs.bundle_prefix }}"
+          CFG="LoopConfigOverride.xcconfig"
+          touch "$CFG"
+
+          # 1) 包名（Bundle ID）。官方 xcconfig 的注释里写明覆盖点是 MAIN_APP_BUNDLE_IDENTIFIER，
+          #    默认值是 com.${DEVELOPMENT_TEAM}.loopkit。
+          #    免费方案没有 Team ID，默认值会算成不合法的 com..loopkit，
+          #    手机上注册 App ID 会直接失败，所以必须自己填一个合法前缀。
+          if ! grep -q "^MAIN_APP_BUNDLE_IDENTIFIER" "$CFG"; then
+            printf '\nMAIN_APP_BUNDLE_IDENTIFIER = com.%s.loop\n' "$PREFIX" >> "$CFG"
+          fi
+
+          # 2) 官方《Build Free Loop》要求免费账号构建时带上 SIRI_DISABLED 编译条件。
+          #    注意：官方 xcconfig 里已经有一行 SWIFT_ACTIVE_COMPILATION_CONDITIONS，
+          #    所以要"追加"而不是"新增一行"（同一个变量写两行只有最后一行生效，会丢掉官方特性开关）。
+          if grep -q "^SWIFT_ACTIVE_COMPILATION_CONDITIONS" "$CFG"; then
+            if ! grep -q "SIRI_DISABLED" "$CFG"; then
+              sed -i '' 's/^SWIFT_ACTIVE_COMPILATION_CONDITIONS *= *\(.*\)$/SWIFT_ACTIVE_COMPILATION_CONDITIONS = \1 SIRI_DISABLED/' "$CFG"
+            fi
+          else
+            printf 'SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) SIRI_DISABLED\n' >> "$CFG"
+          fi
+
+          echo "===== $CFG ====="
+          cat "$CFG"
+          set +x
+
+      - name: Strip unsupported entitlements
+        run: |
+          # 免费 Apple ID 签不动这些能力。编译时签名是关掉的，这些键一般不会进到 IPA 里；
+          # 这一步是保险，确保手机端 SideStore 重签时不会去申请它签不了的能力：
+          #   aps-environment                      推送通知（含 Nightscout 远程指令）
+          #   com.apple.developer.siri             Siri
+          #   com.apple.developer.usernotifications.time-sensitive  时间敏感通知（击穿静音/专注）
+          #   com.apple.developer.nfc.readersession.formats         NFC 读卡（瞬感扫卡用）
+          #   com.apple.developer.healthkit.access 临床健康记录（HealthKit 本体保留）
+          find . -name "*.entitlements" -not -path "./.git/*" | while read -r f; do
+            for key in \
+              com.apple.developer.usernotifications.time-sensitive \
+              com.apple.developer.siri \
+              aps-environment \
+              com.apple.developer.nfc.readersession.formats \
+              com.apple.developer.healthkit.access ; do
+              /usr/libexec/PlistBuddy -c "Delete :$key" "$f" 2>/dev/null || true
+            done
+            echo "--- $f"
+            cat "$f"
+          done
+
+      - name: Show schemes (troubleshooting aid)
+        run: xcodebuild -list -workspace LoopWorkspace.xcworkspace || true
+
+      - name: Build without code signing
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace LoopWorkspace.xcworkspace \
+            -scheme LoopWorkspace \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | tail -n 300
+
+      - name: Package unsigned IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "未找到 .app，请查看下面的构建日志"
+            echo "----- build.log 末尾 -----"
+            tail -n 200 build.log || true
+            exit 1
+          fi
+          echo "找到 App: $APP"
+          rm -rf out
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          ( cd out && zip -qry Loop-unsigned.ipa Payload )
+          ls -lh out/Loop-unsigned.ipa
+
+      - name: Upload IPA (retention 14 days)
+        uses: actions/upload-artifact@v6
+        with:
+          name: Loop-unsigned-ipa
+          path: out/Loop-unsigned.ipa
+          retention-days: 14
+
+      - name: Upload build log if failed
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+# ============================================================
+# 常见报错与改法
+#
+# 1) "scheme not found" / 找不到 scheme
+#    → 看本次运行日志里 "Show schemes" 那一步的输出，把上面的 -scheme 改成实际列出的名字。
+#
+# 2) 在 Watch / watchOS 目标上编译失败
+#    → 把 -scheme LoopWorkspace 改成 -scheme Loop 再跑一次。
+#      不要手表 App 不影响 Loop 主体功能。
+#
+# 3) SWIFT_ACTIVE_COMPILATION_CONDITIONS 相关错误
+#    → 把"追加 SIRI_DISABLED"那段改成不追加（删掉那个 if 块），再跑一次。
+#      （签名已关闭，没有 Siri 能力通常也能正常进 App）
+#
+# 4) 打包时报 "未找到 .app"
+#    → 看日志里 "----- build.log 末尾 -----" 的内容；或直接下载 build-log 这个 Artifact，
+#      搜索 Products 找到真实产物路径，改 find 的那行路径。
+#
+# 5) 手机端 SideStore 报 "App ID not available" / 无法注册
+#    → 多半是包名里的前缀太随意，或免费账号这个 7 天内注册的 App ID 用完了
+#      （免费账号有数量上限，一周内新注册的 App ID 是有限的）。
+#      把入参 bundle_prefix 改成更独特的英文串重新构建；或过几天再试。
+#
+# 6) 手机端 SideStore 报 entitlement / profile 错误
+#    → 核对 "Strip unsupported entitlements" 那步的日志，确认 5 个键都被删掉了。
+#
+# 注意：本工作流不产生任何苹果密钥，也不上传到 TestFlight；
+#       工作流运行的仓库保持 Public 才不计费（私有仓库 macOS runner 按 10 倍计费）。
+# ============================================================
